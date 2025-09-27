@@ -18,6 +18,6 @@ It allows users to explore the world through different map layers and features, 
 
 ## 📊 Languages Used
 
-![JavaScript](https://img.shields.io/badge/JavaScript-50%25-yellow)
-![CSS](https://img.shields.io/badge/CSS-26%25-blueviolet)
-![HTML](https://img.shields.io/badge/HTML-24%25-orange)
+![JavaScript](https://img.shields.io/badge/JavaScript-55%25-yellow)
+![CSS](https://img.shields.io/badge/CSS-23%25-blueviolet)
+![HTML](https://img.shields.io/badge/HTML-21%25-orange)
