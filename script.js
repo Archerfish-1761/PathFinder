@@ -1,177 +1,127 @@
-// 👇 Detect environment: use localhost during development, otherwise use deployed backend
-const API_BASE = window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1"
-  ? "http://localhost:3000"
-  : "https://your-backend-url.vercel.app";  // <-- replace with actual deployed backend later
+// server.js — secure proxy (no key leaks)
+require("dotenv").config();
+const express = require("express");
+const fetch = require("node-fetch");
+const app = express();
 
-// --- Map setup ---
-const map = new maplibregl.Map({
-  container: 'map',
-  style: `${API_BASE}/api/maptiler/streets`,   // fixed: use API_BASE
-  center: [15.4266, 53.5721], // lng, lat
-  zoom: 4.5
+/* -------- CORS (simple + safe) -------- */
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") return res.sendStatus(200);
+  next();
 });
 
-// Add controls
-map.addControl(new maplibregl.NavigationControl(), 'top-right');
-map.addControl(new maplibregl.ScaleControl({ maxWidth: 100, unit: 'metric' }));
-
-// --- Basemap styles (via backend MapTiler proxy) ---
-const styles = {
-  street: `${API_BASE}/api/maptiler/streets`,
-  satellite: `${API_BASE}/api/maptiler/hybrid`,
-  dark: `${API_BASE}/api/maptiler/darkmatter`,
-  terrain: `${API_BASE}/api/maptiler/topo`
-};
-
-// --- Thunderforest Style Helper (via backend proxy) ---
-function thunderforestStyle(type) {
-  const retina = window.devicePixelRatio > 1 ? true : false;
-  const tileSize = window.devicePixelRatio > 1 ? 512 : 256;
-
-  return {
-    version: 8,
-    sources: {
-      tf: {
-        type: 'raster',
-        tiles: [
-          `${API_BASE}/api/thunderforest/${type}/{z}/{x}/{y}.png?retina=${retina}`
-        ],
-        tileSize,
-        attribution: '© OSM, © Thunderforest'
-      }
-    },
-    layers: [
-      {
-        id: 'tf-layer',
-        type: 'raster',
-        source: 'tf',
-        paint: { 'raster-fade-duration': 300 }
-      }
-    ]
-  };
+/* Small helper: stream an upstream HTTP response to the client */
+async function streamProxy(res, url, init = {}) {
+  const upstream = await fetch(url, init);
+  res.status(upstream.status);
+  const ct = upstream.headers.get("content-type");
+  if (ct) res.setHeader("Content-Type", ct);
+  const cc = upstream.headers.get("cache-control");
+  if (cc) res.setHeader("Cache-Control", cc);
+  upstream.body.pipe(res);
 }
 
-// --- MapTiler style buttons ---
-document.getElementById('btn-street').addEventListener('click', () => map.setStyle(styles.street));
-document.getElementById('btn-sat').addEventListener('click', () => map.setStyle(styles.satellite));
-document.getElementById('btn-dark').addEventListener('click', () => map.setStyle(styles.dark));
-document.getElementById('btn-terrain').addEventListener('click', () => map.setStyle(styles.terrain));
+/* =======================
+   MapTiler (SAFE)
+   ======================= */
 
-// --- Thunderforest dropdown ---
-document.getElementById('tf-select').addEventListener('change', e => {
-  map.setStyle(thunderforestStyle(e.target.value));
-});
+/**
+ * 1) Style endpoint:
+ *    Fetch style.json from MapTiler, then rewrite any URLs (sprite, glyphs, tiles, sources.url)
+ *    to hit our own /api/maptiler/asset/* proxy instead of api.maptiler.com?key=...
+ */
+app.get("/api/maptiler/:style", async (req, res) => {
+  try {
+    const style = req.params.style; // streets | hybrid | darkmatter | topo
+    const url = `https://api.maptiler.com/maps/${style}/style.json?key=${process.env.MAPTILER_KEY}`;
 
-// --- Search (Nominatim, no key needed) ---
-const searchInput = document.getElementById('search-input');
-const searchBtn = document.getElementById('search-btn');
-let marker;
+    const r = await fetch(url);
+    if (!r.ok) return res.status(r.status).json({ error: `MapTiler style fetch failed (${r.status})` });
+    const styleJson = await r.json();
 
-function searchLocation() {
-  const query = searchInput.value.trim();
-  if (!query) return;
+    const origin = `${req.protocol}://${req.get("host")}`;
+    const toProxy = (u) =>
+      u
+        .replace(/^https:\/\/api\.maptiler\.com\//, `${origin}/api/maptiler/asset/`)
+        .replace(/(\?|&)key=[^&]*/g, "") // strip any key in the style
+        .replace(/\?$/, ""); // clean trailing ?
 
-  fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}`)
-    .then(res => res.json())
-    .then(data => {
-      if (data.length) {
-        const p = data[0];
-        const lng = parseFloat(p.lon), lat = parseFloat(p.lat);
-        map.flyTo({ center: [lng, lat], zoom: 13 });
+    if (styleJson.sprite) styleJson.sprite = toProxy(styleJson.sprite);
+    if (styleJson.glyphs) styleJson.glyphs = toProxy(styleJson.glyphs);
 
-        if (marker) marker.remove();
-        marker = new maplibregl.Marker().setLngLat([lng, lat])
-          .setPopup(new maplibregl.Popup().setText(p.display_name))
-          .addTo(map).togglePopup();
-      } else {
-        alert('Location not found.');
+    if (styleJson.sources) {
+      for (const src of Object.values(styleJson.sources)) {
+        if (src.url) src.url = toProxy(src.url);
+        if (Array.isArray(src.tiles)) src.tiles = src.tiles.map(toProxy);
       }
-    })
-    .catch(err => console.error(err));
-}
-
-searchBtn.addEventListener('click', searchLocation);
-searchInput.addEventListener('keyup', e => { if (e.key === 'Enter') searchLocation(); });
-
-// --- OpenRouteService (via backend proxy) ---
-function getRoute(start, end) {
-  const url = `${API_BASE}/api/route?start=${start[0]},${start[1]}&end=${end[0]},${end[1]}`;
-
-  fetch(url)
-    .then(res => res.json())
-    .then(data => {
-      if (map.getSource("route")) {
-        map.removeLayer("route");
-        map.removeSource("route");
-      }
-
-      map.addSource("route", {
-        type: "geojson",
-        data: data.features[0].geometry
-      });
-
-      map.addLayer({
-        id: "route",
-        type: "line",
-        source: "route",
-        paint: {
-          "line-color": "#4285F4",
-          "line-width": 4
-        }
-      });
-
-      const coords = data.features[0].geometry.coordinates;
-      const bounds = coords.reduce(
-        (b, c) => b.extend(c),
-        new maplibregl.LngLatBounds(coords[0], coords[0])
-      );
-      map.fitBounds(bounds, { padding: 50 });
-    })
-    .catch(err => console.error("ORS error:", err));
-}
-
-// ------------------------------------------------------------------
-// Directions Panel Logic
-// ------------------------------------------------------------------
-const directionsBtn = document.getElementById('directions-btn');
-const directionsPanel = document.getElementById('directions-panel');
-const closeBtn = document.querySelector('.close-btn');
-const routeBtn = document.getElementById('route-btn');
-const startInput = document.getElementById('start-input');
-const endInput = document.getElementById('end-input');
-
-directionsBtn.addEventListener('click', () => {
-  directionsPanel.style.display = 'block';
-});
-
-closeBtn.addEventListener('click', () => {
-  directionsPanel.style.display = 'none';
-});
-
-// Handle route request
-routeBtn.addEventListener('click', () => {
-  const startQuery = startInput.value.trim();
-  const endQuery = endInput.value.trim();
-
-  if (!startQuery || !endQuery) {
-    alert("Please enter both start and destination.");
-    return;
-  }
-
-  // Geocode start & end with Nominatim
-  Promise.all([
-    fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(startQuery)}`).then(r => r.json()),
-    fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(endQuery)}`).then(r => r.json())
-  ])
-  .then(([startData, endData]) => {
-    if (startData.length && endData.length) {
-      const startCoords = [parseFloat(startData[0].lon), parseFloat(startData[0].lat)];
-      const endCoords = [parseFloat(endData[0].lon), parseFloat(endData[0].lat)];
-
-      getRoute(startCoords, endCoords);
-    } else {
-      alert("Could not find one of the locations.");
     }
-  })
-  .catch(err => console.error("Geocoding error:", err));
+
+    res.setHeader("Content-Type", "application/json");
+    res.send(JSON.stringify(styleJson));
+  } catch (e) {
+    console.error("MapTiler style proxy error:", e);
+    res.status(500).json({ error: "Failed to proxy MapTiler style" });
+  }
 });
+
+/**
+ * 2) Asset endpoint:
+ *    Handles ALL MapTiler assets referenced by the rewritten style:
+ *    - tiles.json / vector tiles (.pbf)
+ *    - raster tiles (.png/.jpg)
+ *    - sprites (.json/.png)
+ *    - glyphs (fonts .pbf)
+ */
+app.get("/api/maptiler/asset/*", async (req, res) => {
+  try {
+    const path = req.params[0]; // everything after /asset/
+    const joiner = path.includes("?") ? "&" : "?";
+    const url = `https://api.maptiler.com/${path}${joiner}key=${process.env.MAPTILER_KEY}`;
+    await streamProxy(res, url);
+  } catch (e) {
+    console.error("MapTiler asset proxy error:", e);
+    res.status(500).json({ error: "Failed to proxy MapTiler asset" });
+  }
+});
+
+/* =======================
+   Thunderforest (SAFE)
+   ======================= */
+
+app.get("/api/thunderforest/:type/:z/:x/:y.png", async (req, res) => {
+  try {
+    const { type, z, x, y } = req.params;
+    const retina = req.query.retina === "true" ? "@2x" : "";
+    const url = `https://tile.thunderforest.com/${type}/${z}/${x}/${y}${retina}.png?apikey=${process.env.THUNDERFOREST_KEY}`;
+    await streamProxy(res, url);
+  } catch (e) {
+    console.error("Thunderforest proxy error:", e);
+    res.status(500).json({ error: "Failed to proxy Thunderforest tile" });
+  }
+});
+
+/* =======================
+   OpenRouteService (SAFE)
+   ======================= */
+
+app.get("/api/route", async (req, res) => {
+  try {
+    const { start, end } = req.query; // "lon,lat"
+    if (!start || !end) return res.status(400).json({ error: "start and end are required" });
+
+    const url = `https://api.openrouteservice.org/v2/directions/driving-car?api_key=${process.env.ORS_KEY}&start=${start}&end=${end}`;
+    const r = await fetch(url, { headers: { Accept: "application/json" } });
+    const data = await r.json();
+    res.status(r.status).json(data);
+  } catch (e) {
+    console.error("ORS proxy error:", e);
+    res.status(500).json({ error: "Failed to fetch route" });
+  }
+});
+
+/* ---------- Boot ---------- */
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
